@@ -1,0 +1,552 @@
+## Random Forest Classification with Sentinel-2 Imagery
+
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED"),
+    dem = ee.Image("USGS/3DEP/10m"),
+    hand = ee.Image("MERIT/Hydro/v1_0_1"),
+    box = ee.FeatureCollection("projects/ee-cnj08910/assets/Box"),
+    boundary = ee.FeatureCollection("projects/ee-cnj08910/assets/2023_Sum_BandelierEC_StudyArea");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//***************ASSETS (Boundary and visulaization parameters)***************
+  
+//Bring in Park Boundary shapefile
+var boundary = ee.FeatureCollection ('projects/ee-cnj08910/assets/2023_Sum_BandelierEC_StudyArea');
+
+// STABLE INPUTS
+
+//Set map defaults
+Map.setOptions('SATELLITE');
+Map.centerObject(boundary, 12);
+
+//*****************PART I:DEFINE FUNCTIONS*****************
+
+// INDICES CALCULATIONS 
+//NDVI function
+// NDVI 
+function NDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi)}
+var visParamsNDVI = {min: 0.1, max: 0.7, palette:['red','yellow','green']};
+
+// EVI
+function EVI(image) {
+  var evi = image.expression(
+      '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))', {
+        'NIR': image.select('B8'),
+        'RED': image.select('B4'),
+        'BLUE': image.select('B2')}).rename('EVI');
+  return image.addBands(evi)}
+var visParamsEVI = {min:0.3, max:2.9, palette:['blue','white','green']};
+
+// MSAVI-2 
+function MSAVI(image) {
+  var msavi = image.expression(
+  '.5 * (2 * NIR + 2 - sqrt((2 *  NIR + 1)**2 - 8 * (NIR - RED)))', {
+  'NIR': image.select('B8'),
+  'RED': image.select('B4')}).rename('MSAVI');
+  return image.addBands(msavi)}
+var visParamsMSAVI = {min: 0.6, max: 1.2, palette:['brown','yellow','green']};
+
+// NDMI
+function NDMI (image) {
+  var ndmi = image.normalizedDifference(['B8', 'B11']).rename('NDMI');
+  return image.addBands(ndmi)}
+var visParamsNDMI = {min: -0.2, max: 0.2, palette: ['brown','white','blue']};
+
+// Tasseled Cap brightness, wetness, greenness
+function TCB(image) {
+  var tcb = image.expression(
+  'BLUE * 0.3510 + GREEN * 0.3813 + RED * 0.3437 + NIR * 0.7196 + SWIR1 * 0.2396 + SWIR2 * 0.1949', {
+   'BLUE': image.select('B2'),
+   'GREEN': image.select('B3'), 
+   'RED': image.select('B4'),
+   'NIR': image.select('B8'),
+   'SWIR1': image.select('B11'), 
+   'SWIR2': image.select('B12')
+    }).rename('TCB');
+  return image.addBands(tcb)}
+var visParamsTCB = {min:4500, max:7000, palette:['black','yellow','white']};
+
+function TCW(image) {
+  var tcw = image.expression(
+  'BLUE * 0.2578 + GREEN * 0.2305 + RED * 0.0883 + NIR * 0.1071 - SWIR1 * 0.7611 - SWIR2 * 0.5308', {
+   'BLUE': image.select('B2'),
+   'GREEN': image.select('B3'), 
+   'RED': image.select('B4'),
+   'NIR': image.select('B8'),
+   'SWIR1': image.select('B11'), 
+   'SWIR2': image.select('B12')
+  }).rename('TCW'); 
+  return image.addBands(tcw)}
+var visParamsTCW = {min:-3100, max:-1500, palette:['black','purple','blue']};
+
+function TCG(image) {
+  var tcg = image.expression(
+    'BLUE * (-0.3599) - GREEN * 0.3533 - RED * 0.4734 + NIR * 0.6633 + SWIR1 * 0.0087 - SWIR2 * 0.2856', {
+   'BLUE': image.select('B2'),
+   'GREEN': image.select('B3'), 
+   'RED': image.select('B4'),
+   'NIR': image.select('B8'),
+   'SWIR1': image.select('B11'), 
+   'SWIR2': image.select('B12')
+  }).rename('TCG');
+  return image.addBands(tcg)}
+var visParamsTCG = {min:-1300, max:600, palette:['black','yellow','green']};
+
+
+//LAI
+function LAI(image) {
+  var lai = image.expression('2.5 * (2.4 * b(0) + 1)', {'b': 'EVI'}).rename('LAI');
+  return image.addBands(lai)}
+var visParamsLAI = {min: 0, max: 5, palette: ['000000', '00FF00']};
+
+
+//*********PART II: LOADING DATA AND SHAPEFILE. CREATING CLOUD MASK**********
+// Setting criteria for sentinel image collection
+// May 1 - August 1 every year from 2021 - 2023
+// filtered by study area
+var criteria = ee.Filter.and(ee.Filter.calendarRange(2021,2023,'year'),
+  ee.Filter.calendarRange(4,8,'month'),
+  ee.Filter.bounds(box));
+  
+// function to clip image
+function clipimg(image) {
+  return image.clip(box)}
+  
+// Create cloud mask function 
+var MAX_CLOUD_PROBABILITY = 75;
+
+function maskClouds(img) {
+  var clouds = ee.Image(img.get('cloud_mask')).select('probability');
+  var isNotCloud = clouds.lt(MAX_CLOUD_PROBABILITY);
+  return img.updateMask(isNotCloud); }
+  
+// Ensure that bad data at the edge of the study area is getting masked as well
+function maskEdges(s2_img) {
+  return s2_img.updateMask(
+    s2_img.select('B8A').mask().updateMask(s2_img.select('B9').mask())); }
+    
+// collect sentinel 2 harmonized and cloud probability datasets
+// according to criteria
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filter(criteria).filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 20).map(maskEdges).map(clipimg);
+
+var s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY").filter(criteria);
+
+// join sentinel with cloud probability data
+var s2SrWithCloudMask = ee.Join.saveFirst('cloud_mask').apply({
+  primary: s2,
+  secondary: s2Clouds,
+  condition: ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'}) });
+  
+var sentinel = ee.ImageCollection(s2SrWithCloudMask).map(maskClouds).toList(120);
+  
+// later apply cloud mask and send to list
+print('Sentinel collection', sentinel);
+
+// choose an image out of indexedSentinel collection (0-61) and print layers to map
+//6-23-2023
+var image = ee.Image(sentinel.get(61));
+
+
+// overwrite original bands with .divide(10000)
+var badBands = image.select('B.*').divide(10000);
+image = image.addBands({
+  srcImg: badBands,
+  overwrite: true});
+  
+// add all indices to selected image
+image = NDVI(NDMI(EVI(MSAVI(TCW(TCG(TCB(LAI(image))))))));
+
+print('Selected image', image);
+
+// Find min and max of all bands in the image.
+var minMax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: box});
+print('min and max', minMax);
+
+
+//**************PART III: PRINCIPLE COMPONENT ANAYSIS*************
+// dem elevation
+var elevation = dem.select('elevation');
+image = image.addBands([elevation]);
+
+// print(dem.first(),'dem first')
+// print(image,'image with dem')
+
+//ADD THESE BACK IN TO INCORPORATE HAND, add 'hnd' to end of band list
+var hnd = hand.select("hnd");
+var image = image.addBands([hnd]);
+
+// Select an image and bands of interest
+var PCAimage = image.select(['NDVI','NDMI','EVI','MSAVI','TCW','TCG','TCB', 'LAI',
+  'B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12','elevation','hnd']);
+
+// variables for later
+var scale = 10;
+var bandNames = PCAimage.bandNames();
+
+// Mean center the data to enable a faster covariance reducer 
+// and an SD stretch of the principal components.
+var meanDict = PCAimage.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: box,
+    scale: scale,
+    maxPixels: 5e7, // these are for if you're using a larger study area
+    bestEffort: true // will help computation time
+});
+var means = ee.Image.constant(meanDict.values(bandNames));
+var centered = PCAimage.subtract(means);
+
+// This function creates new band names for us
+var getNewBandNames = function(prefix) {
+  var seq = ee.List.sequence(1, bandNames.length());
+  return seq.map(function(b) {
+    return ee.String(prefix).cat(ee.Number(b).int());
+    });
+  };
+
+
+// Principal Components in the region as a new image.
+var getPrincipalComponents = function(centered, scale, region) {
+  // Collapse the bands of the image into a 1D array per pixel.
+  var arrays = centered.toArray();
+
+  // Compute the covariance of the bands within the region.
+  var covar = arrays.reduceRegion({
+    reducer: ee.Reducer.centeredCovariance(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 5e7, // for large study area or very fine data to reduce computation time
+    bestEffort: true,
+  });
+
+  // Get the 'array' covariance result and cast to an array.
+  // This represents the band-to-band covariance within the region.
+  var covarArray = ee.Array(covar.get('array'));
+
+  // Perform an eigen analysis and slice apart the values and vectors.
+  var eigens = covarArray.eigen();
+  
+  // This is a P-length vector of Eigenvalues.
+  var eigenValues = eigens.slice(1, 0, 1);
+  // This is a PxP matrix with eigenvectors in rows.
+  var eigenVectors = eigens.slice(1, 1);
+
+  // Convert the array image to 2D arrays for matrix computations.
+  var arrayImage = arrays.toArray(1);
+
+  // Left multiply the image array by the matrix of eigenvectors.
+  var principalComponents = ee.Image(eigenVectors).matrixMultiply(arrayImage);
+
+  // Turn the square roots of the Eigenvalues into a P-band image.
+  var sdImage = ee.Image(eigenValues.abs().sqrt())
+    .arrayProject([0]).arrayFlatten([getNewBandNames('sd')]);
+
+  // Determine how many components capture most of the variance
+  var eigenValuesList = eigenValues.toList().flatten();
+  var total = eigenValuesList.reduce(ee.Reducer.sum());
+  var percentVariance = eigenValuesList.map(function(item) {
+    return (ee.Number(item).divide(total)).multiply(100).format('%.5f');
+  });
+  
+  print('Eigenvalues:', eigenValues);
+  print('Percent Variance of each component:', percentVariance);
+
+  // Turn the PCs into a P-band image, normalized by SD.
+  return principalComponents
+    // Throw out an an unneeded dimension, [[]] -> [].
+    .arrayProject([0])
+    // Make the one band array image a multi-band image, [] -> image.
+    .arrayFlatten([getNewBandNames('pc')])
+    // Normalize the PCs by their SDs.
+    .divide(sdImage);};
+    
+// Get the PCs at the specified scale and in the specified region
+var pcImage = getPrincipalComponents(centered, scale, box);
+
+// Create new layer for each PC and add to PC image and original image
+for (var i = 0; i < bandNames.length().getInfo(); i++) {
+  var band = pcImage.bandNames().get(i).getInfo();
+  image = image.addBands(pcImage.select([band]));
+//  Map.addLayer(pcImageVeg.select([bandV]), {min: -2, max: 2}, bandV); 
+}
+
+// print info about PCA image and original image to make sure nothing went awry 
+print('PCA Image + bands', pcImage);
+print('original image with pca bands appended', image);
+
+Map.addLayer(pcImage.select(['pc1','pc2','pc3','pc4','pc5']), {min: -2, max: 2}, 'PCA IMAGE'); 
+
+// Set the export "scale" and "crs" parameters.
+Export.image.toAsset({
+  image: pcImage.select(['pc1','pc2','pc3','pc4','pc5']),
+  description: 'PCA_Image', 
+  region: box,
+  scale: 10,
+});
+
+## PART 2
+
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED"),
+    dem = ee.Image("USGS/3DEP/10m"),
+    hand = ee.Image("MERIT/Hydro/v1_0_1"),
+    box = ee.FeatureCollection("projects/ee-cnj08910/assets/Box"),
+    testingSet = ee.FeatureCollection("projects/ee-cnj08910/assets/testingSet"),
+    trainingSet = ee.FeatureCollection("projects/ee-cnj08910/assets/trainingSet"),
+    boundary = ee.FeatureCollection("projects/ee-cnj08910/assets/2023_Sum_BandelierEC_StudyArea"),
+    pcaImage2021 = ee.Image("users/evanbarrett/PCA_Image_2021"),
+    pcaImage2019 = ee.Image("projects/ee-meganmrich14/assets/pcaImage2019"),
+    pcaImage2020 = ee.Image("projects/ee-meganmrich14/assets/pcaImage2020"),
+    park_buff = ee.FeatureCollection("projects/ee-meganmrich14/assets/park_boundary_buffered"),
+    corridors_buff = ee.FeatureCollection("projects/ee-meganmrich14/assets/Study_Corridors_200mBuff"),
+    pcaImage2022 = ee.Image("projects/ee-cnj08910/assets/2022_PCA_Image"),
+    trainingSet3 = ee.FeatureCollection("projects/ee-cnj08910/assets/trainingSet3"),
+    testingSet3 = ee.FeatureCollection("projects/ee-cnj08910/assets/testingSet3"),
+    pcaImage2023 = ee.Image("projects/ee-meganmrich14/assets/pcaImage2023");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//***************ASSETS (Boundary and visulaization parameters)***************
+  
+//Bring in Park Boundary shapefile
+var boundary = ee.FeatureCollection ('projects/ee-cnj08910/assets/2023_Sum_BandelierEC_StudyArea');
+
+// STABLE INPUTS
+
+//Set map defaults
+Map.setOptions('SATELLITE');
+Map.centerObject(boundary, 12);
+
+//*****************PART I:DEFINE FUNCTIONS*****************
+
+// INDICES CALCULATIONS 
+//NDVI function
+// NDVI 
+function NDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi)}
+var visParamsNDVI = {min: 0.1, max: 0.7, palette:['red','yellow','green']};
+
+// EVI
+function EVI(image) {
+  var evi = image.expression(
+      '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))', {
+        'NIR': image.select('B8'),
+        'RED': image.select('B4'),
+        'BLUE': image.select('B2')}).rename('EVI');
+  return image.addBands(evi)}
+var visParamsEVI = {min:0.3, max:2.9, palette:['blue','white','green']};
+
+// MSAVI-2 
+function MSAVI(image) {
+  var msavi = image.expression(
+  '.5 * (2 * NIR + 2 - sqrt((2 *  NIR + 1)**2 - 8 * (NIR - RED)))', {
+  'NIR': image.select('B8'),
+  'RED': image.select('B4')}).rename('MSAVI');
+  return image.addBands(msavi)}
+var visParamsMSAVI = {min: 0.6, max: 1.2, palette:['brown','yellow','green']};
+
+// NDMI
+function NDMI (image) {
+  var ndmi = image.normalizedDifference(['B8', 'B11']).rename('NDMI');
+  return image.addBands(ndmi)}
+var visParamsNDMI = {min: -0.2, max: 0.2, palette: ['brown','white','blue']};
+
+// Tasseled Cap brightness, wetness, greenness
+function TCB(image) {
+  var tcb = image.expression(
+  'BLUE * 0.3510 + GREEN * 0.3813 + RED * 0.3437 + NIR * 0.7196 + SWIR1 * 0.2396 + SWIR2 * 0.1949', {
+   'BLUE': image.select('B2'),
+   'GREEN': image.select('B3'), 
+   'RED': image.select('B4'),
+   'NIR': image.select('B8'),
+   'SWIR1': image.select('B11'), 
+   'SWIR2': image.select('B12')
+    }).rename('TCB');
+  return image.addBands(tcb)}
+var visParamsTCB = {min:4500, max:7000, palette:['black','yellow','white']};
+
+function TCW(image) {
+  var tcw = image.expression(
+  'BLUE * 0.2578 + GREEN * 0.2305 + RED * 0.0883 + NIR * 0.1071 - SWIR1 * 0.7611 - SWIR2 * 0.5308', {
+   'BLUE': image.select('B2'),
+   'GREEN': image.select('B3'), 
+   'RED': image.select('B4'),
+   'NIR': image.select('B8'),
+   'SWIR1': image.select('B11'), 
+   'SWIR2': image.select('B12')
+  }).rename('TCW'); 
+  return image.addBands(tcw)}
+var visParamsTCW = {min:-3100, max:-1500, palette:['black','purple','blue']};
+
+function TCG(image) {
+  var tcg = image.expression(
+    'BLUE * (-0.3599) - GREEN * 0.3533 - RED * 0.4734 + NIR * 0.6633 + SWIR1 * 0.0087 - SWIR2 * 0.2856', {
+   'BLUE': image.select('B2'),
+   'GREEN': image.select('B3'), 
+   'RED': image.select('B4'),
+   'NIR': image.select('B8'),
+   'SWIR1': image.select('B11'), 
+   'SWIR2': image.select('B12')
+  }).rename('TCG');
+  return image.addBands(tcg)}
+var visParamsTCG = {min:-1300, max:600, palette:['black','yellow','green']};
+
+
+//LAI
+function LAI(image) {
+  var lai = image.expression('2.5 * (2.4 * b(0) + 1)', {'b': 'EVI'}).rename('LAI');
+  return image.addBands(lai)}
+var visParamsLAI = {min: 0, max: 5, palette: ['000000', '00FF00']};
+
+
+//*********PART II: LOADING DATA AND SHAPEFILE. CREATING CLOUD MASK**********
+// Setting criteria for sentinel image collection
+// May 1 - August 1 every year from 2021 - 2023
+// filtered by study area
+var criteria = ee.Filter.and(ee.Filter.calendarRange(2019,2023,'year'),
+  ee.Filter.calendarRange(4,8,'month'),
+  ee.Filter.bounds(box));
+  
+// function to clip image
+function clipimg(image) {
+  return image.clip(box)}
+  
+// Create cloud mask function 
+var MAX_CLOUD_PROBABILITY = 75;
+
+function maskClouds(img) {
+  var clouds = ee.Image(img.get('cloud_mask')).select('probability');
+  var isNotCloud = clouds.lt(MAX_CLOUD_PROBABILITY);
+  return img.updateMask(isNotCloud); }
+  
+// Ensure that bad data at the edge of the study area is getting masked as well
+function maskEdges(s2_img) {
+  return s2_img.updateMask(
+    s2_img.select('B8A').mask().updateMask(s2_img.select('B9').mask())); }
+    
+// collect sentinel 2 harmonized and cloud probability datasets
+// according to criteria
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filter(criteria).filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 20).map(maskEdges).map(clipimg);
+
+var s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY").filter(criteria);
+
+// join sentinel with cloud probability data
+var s2SrWithCloudMask = ee.Join.saveFirst('cloud_mask').apply({
+  primary: s2,
+  secondary: s2Clouds,
+  condition: ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'}) });
+  
+var sentinel = ee.ImageCollection(s2SrWithCloudMask).map(maskClouds).toList(120);
+  
+// later apply cloud mask and send to list
+print('Sentinel collection', sentinel);
+
+// choose an image out of indexedSentinel collection (0-61) and print layers to map
+//6-23-2023
+var image = ee.Image(sentinel.get(56));
+
+
+// overwrite original bands with .divide(10000)
+var badBands = image.select('B.*').divide(10000);
+image = image.addBands({
+  srcImg: badBands,
+  overwrite: true});
+  
+// add all indices to selected image
+image = NDVI(NDMI(EVI(MSAVI(TCW(TCG(TCB(LAI(image))))))));
+
+print('Selected image', image);
+
+// Find min and max of all bands in the image.
+var minMax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: box});
+print('min and max', minMax);
+
+//*********************PART: IV RANDOM FOREST*****************************
+//USING 7 CLASSES. COMBINED RUSSIAN OLIVE/COTTONWOOD -->CLASS 4
+//var visParamsRF9= {min:1, max: 8, palette: ['#9855D0','#864B00','#FFEC9D','#ffba0a',
+//'#ACB675','#85BB6A','#FFD192','006400']};
+var visParamsRF9 = {min:1, max:7, palette: ['#64c5fe','#e3e3e3','#a9ccac','#8a00d4',
+'#d527b7','#f782c2','#f9c46b']};
+//decide if you're doing 4 class or 13 class
+var fieldName = 'Class';
+
+// Select relevant bands to train RF
+var randomForest = pcaImage2023;
+// Sample training points
+  var training = randomForest.sampleRegions({
+            collection: trainingSet,
+            properties: ['Class'], 
+            scale: 10
+            });
+            
+// Set up validation sets as well
+var valid = randomForest.sampleRegions({
+            collection: testingSet,
+            properties: ['Class'], 
+            scale: 10
+            });
+
+
+// Specify parameters for a classifier
+//number of trees = 175
+var classifier = ee.Classifier.smileRandomForest(175);
+
+// Train the classifier using the training points
+var trained = classifier.train({
+  features: training, 
+  classProperty: fieldName, 
+  inputProperties: randomForest.bandNames()});
+
+// Return the classified image and add to Map
+var classified = randomForest.classify(trained); 
+//changed from randomForest var to yearly pca images
+Map.addLayer(classified, visParamsRF9, 'classified'); 
+
+// exporting classification
+Export.image.toDrive({
+  image: classified,
+  //.clip(corridors_buff),
+  //add this back above if clipping river
+  description: 'ClassifiedS2Map2023',
+  scale: 10,
+  //region: boundary, this is already defined
+  fileFormat: 'GeoTIFF',
+});
+
+//*****************PART V: Perform accuracy assessments and validation***********
+/*
+// Get a confusion matrix representing resubstitution accuracy.
+var trainAccuracy = trained.confusionMatrix();
+  print('Training confusion matrix: ', trainAccuracy);
+  print('Training overall accuracy: ', trainAccuracy.accuracy());
+  
+//Get a confusion matrix for validation sample
+var test = valid.classify(trained);
+var testAccuracy = test.errorMatrix(fieldName, 'classification');
+print('Validation confusion matrix: ', testAccuracy); //shows confusion matrix
+print('Validation overall accuracy: ', testAccuracy.accuracy()); //shows overall accuracy
+
+// //Export the validation confusion matrix as a CSV 
+
+var exportAccuracy = ee.Feature(null, {matrix: testAccuracy.array()});
+/*
+//Export the FeatureCollection
+ Export.table.toDrive({
+   collection: ee.FeatureCollection(exportAccuracy),
+   description: 'exportAccuracy_2020',
+   fileFormat: 'CSV'
+});
+*/
+//Kappa coefficient
+// print('Kappa statistic-Training', trainAccuracy.kappa());
+//print('Kappa statistic-Validation', testAccuracy.kappa());
+
+//Consumer and producer accuracy
+//print("Consumer's accuracy", testAccuracy.consumersAccuracy());
+//print("Producer's accuracy", testAccuracy.producersAccuracy()); 
+
